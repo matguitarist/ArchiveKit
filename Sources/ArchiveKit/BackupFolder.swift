@@ -1,4 +1,5 @@
 import Foundation
+import ProcessKit
 
 /// A folder of zipped backups: "2026-11-24 14.05.09 - Before restore.zip". Backing up writes beside
 /// the target and moves the zip into place; restoring unpacks beside the folder and swaps it in, so a
@@ -23,13 +24,24 @@ public struct BackupFolder: Sendable {
         }
     }
 
+    /// Which of a backup's file dates is its `date`.
+    public enum Dating: Sendable {
+        /// When the zip was last written (the default).
+        case modified
+        /// When it was made: stays the same when the zip is copied, touched or synced (a backup
+        /// folder in iCloud Drive or on another disk). The modification date when there is none.
+        case created
+    }
+
     public let root: URL
     /// What happens to pruned backups and to the files a restore replaces.
     public let disposal: Disposal
+    public let dating: Dating
 
-    public init(root: URL, disposal: Disposal = .trash) {
+    public init(root: URL, disposal: Disposal = .trash, dating: Dating = .modified) {
         self.root = root
         self.disposal = disposal
+        self.dating = dating
     }
 
     /// "2026-11-24 14.05.09", sorting as text in date order.
@@ -49,12 +61,16 @@ public struct BackupFolder: Sendable {
     ///   - keepParent: the folder itself as the zip's top entry; false puts its content at the top.
     ///   - name: the file name without ".zip"; nil for the date stamp. " - label" follows it, and " 2",
     ///     " 3" when it's taken.
+    ///   - date: the backup's date: its name's stamp when `name` is nil, and the zip's creation and
+    ///     modification dates either way, so `list()` sorts and shows it by this date.
     ///   - macMetadata: false for a plain zip other tools (and other systems) read the same.
+    ///   - cancel: stops it from code that has no task to cancel; nothing is left behind.
     /// Throws `.nothingToBackUp` when there's nothing but hidden files to back up.
     @discardableResult
     public func backUp(
         from folder: URL, items: [String]? = nil, keepParent: Bool = false,
-        name: String? = nil, label: String? = nil, date: Date = .now, macMetadata: Bool = true
+        name: String? = nil, label: String? = nil, date: Date = .now, macMetadata: Bool = true,
+        cancel: Shell.CancelFlag? = nil
     ) async throws -> Backup {
         let files = FileManager.default
         let present = (items ?? ((try? files.contentsOfDirectory(atPath: folder.path)) ?? []))
@@ -65,7 +81,8 @@ public struct BackupFolder: Sendable {
         var base = clean(name ?? Self.stamp(date))
         if let label, !label.isEmpty { base += " - " + clean(label) }
         let zip = UniqueName.url(for: base + ".zip", in: root)
-        try await Zip.pack(folder, to: zip, items: items == nil ? nil : present, keepParent: keepParent, macMetadata: macMetadata)
+        try await Zip.pack(folder, to: zip, items: items == nil ? nil : present, keepParent: keepParent, macMetadata: macMetadata, cancel: cancel)
+        try? files.setAttributes([.creationDate: date, .modificationDate: date], ofItemAtPath: zip.path)
         return try backup(at: zip)
     }
 
@@ -73,7 +90,7 @@ public struct BackupFolder: Sendable {
 
     /// Every backup, newest first. Hidden files (a backup being written) are left out.
     public func list() -> [Backup] {
-        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .creationDateKey, .fileSizeKey]
         let files = (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: keys, options: .skipsHiddenFiles)) ?? []
         return files.filter { $0.pathExtension.lowercased() == "zip" }
             .compactMap { try? backup(at: $0) }
@@ -92,8 +109,10 @@ public struct BackupFolder: Sendable {
     public func backup(at url: URL) throws -> Backup {
         var url = url
         url.removeAllCachedResourceValues()
-        let values = try url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-        return Backup(url: url, date: values.contentModificationDate ?? .distantPast, size: Int64(values.fileSize ?? 0))
+        let values = try url.resourceValues(forKeys: [.contentModificationDateKey, .creationDateKey, .fileSizeKey])
+        let modified = values.contentModificationDate ?? .distantPast
+        let date = dating == .created ? (values.creationDate ?? modified) : modified
+        return Backup(url: url, date: date, size: Int64(values.fileSize ?? 0))
     }
 
     // MARK: Restoring
@@ -104,23 +123,34 @@ public struct BackupFolder: Sendable {
     /// its only folder when it holds one folder) replaces `folder` in one move, and the old folder goes
     /// to `disposal`. With `items`, each of those top-level names replaces the one in `folder`; the
     /// others stay. Make a "Before restore" backup first when the current files matter.
-    /// - Parameter accept: the app's check that the content is a backup of its files (a saves folder);
-    ///   when it says no, `.notABackup` is thrown and nothing changes.
-    public func restore(_ backup: Backup, into folder: URL, items: [String]? = nil,
-                        accept: (@Sendable (URL) -> Bool)? = nil) async throws {
+    /// - Parameters:
+    ///   - keepsTopFolder: the zip's top folder is restored as itself: a backup of "Mats_391030616" (made
+    ///     with `keepParent`) replaces `folder`/Mats_391030616 and the other saves stay. With `items`
+    ///     nil, every name at the top of the zip is restored that way. `accept` sees the zip's top.
+    ///   - accept: the app's check that the content is a backup of its files (a saves folder);
+    ///     when it says no, `.notABackup` is thrown and nothing changes.
+    ///   - cancel: stops it from code that has no task to cancel; nothing changes.
+    public func restore(_ backup: Backup, into folder: URL, items: [String]? = nil, keepsTopFolder: Bool = false,
+                        accept: (@Sendable (URL) -> Bool)? = nil, cancel: Shell.CancelFlag? = nil) async throws {
         let files = FileManager.default
         let staging = try Staging.file(beside: folder, purpose: "restoring")
         defer { try? files.removeItem(at: staging) }
         do {
-            try await Zip.unpack(backup.url, into: staging)
+            try await Zip.unpack(backup.url, into: staging, cancel: cancel)
         } catch let error as ArchiveError {
             if case .unsafeEntry = error { throw error }
             throw ArchiveError.notABackup
         }
-        var content = Zip.contentFolder(staging)
+        var content = keepsTopFolder ? staging : Zip.contentFolder(staging)
         if let accept, content != staging, accept(staging) { content = staging }
         if let accept, !accept(content) { throw ArchiveError.notABackup }
+        if cancel?.isCancelled == true { throw CancellationError() }
+        try Task.checkCancellation()
 
+        var items = items
+        if keepsTopFolder, items == nil {
+            items = ((try? files.contentsOfDirectory(atPath: staging.path)) ?? []).filter { !$0.hasPrefix(".") && $0 != "__MACOSX" }.sorted()
+        }
         if let items {
             let present = items.filter { !Safety.isUnsafe($0) && files.fileExists(atPath: content.appending(path: $0).path) }
             guard !present.isEmpty else { throw ArchiveError.notABackup }

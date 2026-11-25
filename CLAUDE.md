@@ -12,12 +12,16 @@ Shared rules for how every project is laid out and named:
 
 - `Sources/ArchiveKit/` Foundation only, macOS only (ditto, unzip, tar through ProcessKit):
   - `Zip.swift`: `isZip`, `entries`, `names`, `uncompressedSize`, `unsafeEntry`, `topLevelNames`, `unpack`,
-    `contentFolder`, `read`, `extract`, `test`, `pack`.
+    `contentFolder`, `read`, `stream`, `hash`, `extract` (one or several), `test`, `pack` (a folder, `files:`,
+    `entries:`); each with a `Sync` twin and a `cancel` flag.
+  - `ZipStream.swift`: an entry's bytes straight from the zip (stored, deflated) with its CRC checked; unzip for
+    other methods.
+  - `Work.swift`: one sync body per call, run on a thread of its own for the async call; the cancel flag.
   - `ZipDirectory.swift`: the central directory reader (ZIP64, symbolic links and their targets).
   - `Safety.swift`: the Zip Slip rules, before and after unpacking.
   - `AnyArchive.swift`: 7z, RAR, tar through bsdtar.
   - `BackupFolder.swift`, `UniqueName.swift`, `Staging.swift` (hidden folders beside the target, the swap,
-    `Disposal`), `ArchiveError.swift`.
+    `Disposal`), `ArchiveError.swift` (sentences in English and French).
 - `Tests/ArchiveKitTests/` Swift Testing. Zips are made in code (`ZipMaker` writes the malicious ones no tool
   would), with ditto, zip and tar; no fixture files.
 

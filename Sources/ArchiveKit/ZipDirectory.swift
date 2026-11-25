@@ -16,6 +16,9 @@ extension Zip {
         public let isSymlink: Bool
         /// Where a symbolic link points, as stored in the zip.
         public let linkTarget: String?
+        /// Where its local header starts, and its general-purpose flags (bit 0: encrypted).
+        var offset: UInt64 = 0
+        var flags: UInt16 = 0
         /// Made by macOS for a resource fork or Finder info (__MACOSX/, ._name).
         public var isMacMetadata: Bool {
             name.hasPrefix("__MACOSX/") || name.split(separator: "/").last?.hasPrefix("._") == true
@@ -58,6 +61,7 @@ extension Zip {
         for _ in 0..<count {
             guard at + 46 <= data.count, data.le32(at) == 0x0201_4b50 else { throw .damaged("bad directory record") }
             let madeBy = data[data.startIndex + at + 5]
+            let flags = data.le16(at + 8)
             let method = data.le16(at + 10)
             let crc = data.le32(at + 16)
             var compressed = UInt64(data.le32(at + 20))
@@ -89,7 +93,7 @@ extension Zip {
             let isDirectory = name.hasSuffix("/") || name.hasSuffix("\\") || mode == 0o040000
             let target = isSymlink ? linkTarget(in: data, localHeader: local, method: method, compressedSize: compressed, size: size) : nil
             entries.append(Entry(name: name, size: size, compressedSize: compressed, method: method, crc32: crc,
-                                 isDirectory: isDirectory, isSymlink: isSymlink, linkTarget: target))
+                                 isDirectory: isDirectory, isSymlink: isSymlink, linkTarget: target, offset: local, flags: flags))
             at = extraEnd + commentLength
         }
         return entries

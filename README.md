@@ -19,7 +19,7 @@ macOS 14 or later. Mac only: it runs ditto, unzip and tar through [ProcessKit](h
 SwiftPM (`Package.swift`):
 
 ```swift
-.package(url: "https://github.com/matguitarist/ArchiveKit", from: "0.1.0"),
+.package(url: "https://github.com/matguitarist/ArchiveKit", from: "0.2.0"),
 // in the target that handles archives:
 .product(name: "ArchiveKit", package: "ArchiveKit"),
 ```
@@ -30,7 +30,7 @@ XcodeGen (`project.yml`):
 packages:
   ArchiveKit:
     url: https://github.com/matguitarist/ArchiveKit
-    from: 0.1.0
+    from: 0.2.0
 targets:
   App:
     dependencies:
@@ -68,6 +68,8 @@ folder, then a file written through it). After unpacking, every link is checked 
 
 ditto doesn't check CRCs; call `try await Zip.test(zip)` first when a damaged download must be caught.
 
+`AnyArchive.unpack` takes `dropsQuarantine: true` too (tar copies the archive's quarantine mark to every file).
+
 ## One entry, without unpacking
 
 ```swift
@@ -76,7 +78,55 @@ try await Zip.extract("Mod/data.win", from: zip, to: game.appending(path: "data.
 let info = try await AnyArchive.read("Mats_391030616/SaveGameInfo", from: sevenZip, limit: 1 << 20)
 ```
 
-Names with `[ ] * ?` are read exactly, not as patterns.
+Names with `[ ] * ?` are read exactly, not as patterns. A zip entry is read straight from the zip (stored or
+deflated, checked against its CRC: `.damaged` when it doesn't match), without running unzip.
+
+Hash or stream an entry without holding it in memory or writing it anywhere:
+
+```swift
+import CryptoKit
+let md5 = try await Zip.hash("AM2R_11/data.win", from: zip, using: Insecure.MD5.self)       // lowercase hex
+let sha = try await AnyArchive.hash("Game/rom.bin", from: sevenZip, using: SHA256.self)     // via a temporary file
+try Zip.stream("MAME.xml", from: zip) { chunk in parser.feed(chunk) }                       // 1 MB at most per chunk
+```
+
+Several entries in one pass, each to its file; nothing is replaced until all are written (a solid 7z is
+decompressed once, not once per entry):
+
+```swift
+try await AnyArchive.extract(["AM2R_11/data.win": work.appending(path: "data.win"),
+                              "AM2R_11/AM2R.exe": work.appending(path: "AM2R.exe")], from: sevenZip)
+try await Zip.extract(["Mod/data.win": dataWin, "Mod/game.ini": ini], from: zip)
+```
+
+## Code that isn't async
+
+Every call has a `Sync` twin that runs on the calling thread (never the main thread for anything slow): a game
+starting, a scan, a rebuild.
+
+```swift
+let rom = try Zip.readSync("Mario (USA).nes", from: zip, limit: 8 << 20)
+try Zip.extractSync(entry, from: zip, to: cache.appending(path: entry))
+let names = try AnyArchive.namesSync(sevenZip)
+try AnyArchive.extractSync(entry, from: sevenZip, to: file)
+let md5 = try Zip.hashSync("data.win", from: zip, using: Insecure.MD5.self)
+try Zip.unpackSync(zip, into: folder)
+try Zip.packSync(entries: names, to: setZip, level: 9, folderEntries: false)
+try Zip.testSync(zip)
+```
+
+## Stop
+
+Cancelling the task stops the tool and throws `CancellationError`, with nothing left behind. Code with a stop
+button and no task to cancel passes ProcessKit's flag; one flag can stop several calls, and ArchiveKit never sets it:
+
+```swift
+import ProcessKit
+let stop = Shell.CancelFlag()            // stop.cancel() from the button, from any thread
+try await Zip.pack(folder, to: zip, cancel: stop)
+try await Zip.unpack(zip, into: out, cancel: stop)
+try Zip.stream(entry, from: zip, cancel: stop) { … }
+```
 
 ## Pack
 
@@ -85,8 +135,27 @@ Names with `[ ] * ?` are read exactly, not as patterns.
 try await Zip.pack(saves, to: backupZip)
 // The folder itself at the top, like the Finder's Compress.
 try await Zip.pack(saveFolder, to: zip, keepParent: true)
-// Some items of a folder, a plain zip without macOS metadata, best compression.
-try await Zip.pack(emulation, to: zip, items: ["Saves", "States"], macMetadata: false, level: 9)
+// Some items of a folder, a plain zip without macOS metadata, best compression. Items can be in subfolders.
+try await Zip.pack(emulation, to: zip, items: ["Saves", "States/Slot 1"], macMetadata: false, level: 9)
+// Without folder entries (zip -D, as arcade romsets want) or the Finder's .DS_Store files.
+try await Zip.pack(romFolder, to: zip, folderEntries: false, dropsDSStore: true)
+
+// Files from several folders side by side at the top, like zip -j (a problem report). "game 2.log" for a twin.
+try await Zip.pack(files: [about, logFile, settings], to: report)
+// Files under names of your choosing, subfolders allowed; ".." and absolute names are refused.
+try await Zip.pack(entries: ["mslug.p1": part1, "sub/mslug.s1": part2], to: setZip, level: 9, folderEntries: false)
+```
+
+`pack(files:)` and `pack(entries:)` make plain zips by default (`macMetadata: false`).
+
+## What a replace does with the old one
+
+`replacing: true` swaps the new one in, then hands the old one to `replaced` (or the backup folder's `disposal`)
+under its own name: it reaches the Trash as "report.zip" or "Saves", never as a hidden work name. To learn where
+it went (Undo, Put Back):
+
+```swift
+try await Zip.pack(sources, to: target, replacing: true, replaced: .trash(reporting: { inTrash in undo.record(inTrash) }))
 ```
 
 ## Other archives
@@ -106,9 +175,16 @@ try await backups.backUp(from: saves, label: "Before restore")
 // Your own name, some items only, the folder itself at the top, a plain zip.
 try await backups.backUp(from: savesFolder, items: ["Mats_391030616"], name: "\(profile) \(stamp)", macMetadata: false)
 
+// The date given is the zip's creation and modification date, with or without a name of your own.
+try await backups.backUp(from: saveFolder, keepParent: true, name: "\(save) \(stamp)", date: now)
+
 let list = backups.list()                  // newest first: url, name, label, date, size
+// Dated by creation instead, which a copy or a sync doesn't change:
+let synced = BackupFolder(root: iCloudBackups, dating: .created)
 try await backups.restore(list[0], into: saves, accept: { $0.appending(path: "config.ini").isFile })
 try await backups.restore(list[0], into: savesFolder, items: ["Mats_391030616"])   // the others stay
+// A backup made with keepParent: its top folder replaces the one of the same name, the others stay.
+try await backups.restore(list[0], into: savesFolder, keepsTopFolder: true)
 try backups.prune(keep: 5, matching: { $0.label == "Auto" })
 try backups.delete(list[0])
 ```
@@ -127,5 +203,7 @@ UniqueName.name(for: "My.Project", in: folder, isFolder: true)
 ## Errors
 
 `ArchiveError`: `notAZip(size:)`, `damaged`, `unsafeEntry`, `tooLarge`, `missingEntry`, `exists`,
-`nothingToBackUp`, `notABackup`, `toolFailed` (the tool's last words). Each has a sentence in
-`localizedDescription`. Cancelling the task stops the tool and throws `CancellationError`, with nothing left behind.
+`nothingToBackUp`, `notABackup`, `toolFailed` (the tool's last words). Each has a sentence to show in
+`localizedDescription`, in French when the app runs in French (`Bundle.main.preferredLocalizations`, so the app's
+own language setting counts) and in English otherwise; `error.message(language: "fr")` picks one yourself. Cancelling
+throws `CancellationError`, with nothing left behind.

@@ -10,7 +10,7 @@ let package = Package(
         .library(name: "ArchiveKit", targets: ["ArchiveKit"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/matguitarist/ProcessKit", from: "0.1.0"),
+        .package(url: "https://github.com/matguitarist/ProcessKit", from: "0.1.1"),
     ],
     targets: [
         .target(name: "ArchiveKit", dependencies: [.product(name: "ProcessKit", package: "ProcessKit")]),
