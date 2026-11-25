@@ -6,7 +6,10 @@ import ProcessKit
 func temporaryFolder() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appending(path: "ArchiveKitTests-\(UUID().uuidString)", directoryHint: .isDirectory)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    return URL(fileURLWithPath: realpath(url.path, nil).map { defer { free($0) }; return String(cString: $0) } ?? url.path, isDirectory: true)
+    guard let real = realpath(url.path, nil) else { return url }
+    let path = String(cString: real)
+    free(real)
+    return URL(fileURLWithPath: path, isDirectory: true)
 }
 
 func writeText(_ text: String, to url: URL) throws {
